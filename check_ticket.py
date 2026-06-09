@@ -3,6 +3,11 @@
 PIA Ticket Checker — GitHub Actions version
 Checks once per run. GitHub Actions calls this every 5 minutes via cron.
 Secrets are passed as environment variables (set in GitHub repo Settings → Secrets).
+
+v2 fixes:
+- Removed false-positive resale check (リセール申込 is always on the page)
+- Now only checks CKT22 block specifically for buy button OR resale button
+- Added Telegram support, removed dead LINE Notify
 """
 
 import os
@@ -13,15 +18,17 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET_URL  = "https://t.pia.jp/pia/ticketInformation.do?eventCd=2610317&rlsCd=002"
-RESALE_URL  = TARGET_URL + "#Y15-resale"
-TARGET_SESSION = "ＣＫＴ２２"           # Oct 3, 14:00 Gold Medal Final
+TARGET_URL     = "https://t.pia.jp/pia/ticketInformation.do?eventCd=2610317&rlsCd=002"
+TARGET_SESSION = "ＣＫＴ２２"   # Oct 3, 14:00 Gold Medal Final
+# How many chars to scan after CKT22 marker (covers price + button area)
+BLOCK_SIZE     = 1500
 
-# Secrets come from GitHub Actions environment variables
-GMAIL_USER   = os.environ.get("GMAIL_USER", "")
-GMAIL_PASS   = os.environ.get("GMAIL_PASS", "")
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
-LINE_TOKEN   = os.environ.get("LINE_TOKEN", "")
+# Secrets from GitHub Actions environment variables
+GMAIL_USER        = os.environ.get("GMAIL_USER", "")
+GMAIL_PASS        = os.environ.get("GMAIL_PASS", "")
+NOTIFY_EMAIL      = os.environ.get("NOTIFY_EMAIL", "")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 HEADERS = {
     "User-Agent": (
@@ -33,11 +40,30 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# ── What to look for INSIDE the CKT22 block only ─────────────────────────────
+#
+# TRIGGER alert if ANY of these appear inside the CKT22 block:
+#   枚数選択へ  = orange "Select quantity" buy button is live
+#   発売中      = "On sale" status label
+#   リセール可  = "Resale available" label on THIS specific ticket
+#
+# DO NOT alert on:
+#   リセール申込  — this is a global footer link, always on the page, NOT CKT22-specific
+#   リセールチケットがあります — also a page-wide banner, unreliable
+#
+AVAILABLE_TRIGGERS = [
+    "枚数選択へ",   # Buy button appeared — act immediately
+    "発売中",       # On-sale status
+    "リセール可",   # Resale available label on this ticket block
+]
+
+SOLD_OUT_MARKER = "予定枚数終了"
+
 # ── Notification functions ────────────────────────────────────────────────────
 
 def send_email(subject, body):
     if not GMAIL_USER or not GMAIL_PASS:
-        print("⚠️  Email skipped — credentials not set")
+        print("⚠️  Email skipped — GMAIL_USER/GMAIL_PASS not set")
         return
     try:
         msg = MIMEMultipart()
@@ -53,30 +79,29 @@ def send_email(subject, body):
         print(f"❌ Email error: {e}")
 
 
-def send_line(message):
-    if not LINE_TOKEN:
-        print("⚠️  LINE skipped — token not set")
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️  Telegram skipped — TELEGRAM_TOKEN/TELEGRAM_CHAT_ID not set")
         return
     try:
         r = requests.post(
-            "https://notify-api.line.me/api/notify",
-            headers={"Authorization": f"Bearer {LINE_TOKEN}"},
-            data={"message": message},
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
             timeout=10,
         )
         if r.status_code == 200:
-            print("✅ LINE notification sent")
+            print("✅ Telegram notification sent")
         else:
-            print(f"❌ LINE failed: {r.status_code} — {r.text}")
+            print(f"❌ Telegram failed: {r.status_code} — {r.text}")
     except Exception as e:
-        print(f"❌ LINE error: {e}")
+        print(f"❌ Telegram error: {e}")
 
 
-def notify_all(title, body, url):
-    full_body = f"{body}\n\n🎟 Buy now:\n{url}"
+def notify_all(title, body):
+    full_message = f"🏏 {title}\n\n{body}\n\n🎟 Buy now:\n{TARGET_URL}"
     print(f"\n🚨 ALERT: {title}")
-    send_email(f"🏏 {title}", full_body)
-    send_line(f"\n🏏 {title}\n{full_body}")
+    send_email(f"🏏 {title}", full_message)
+    send_telegram(full_message)
 
 
 # ── Main check ────────────────────────────────────────────────────────────────
@@ -89,41 +114,37 @@ def check():
         html = r.text
     except Exception as e:
         print(f"❌ Fetch failed: {e}")
-        sys.exit(0)  # Exit cleanly — don't fail the Action on network errors
-
-    # 1. Check for resale section appearing anywhere on the page
-    if "リセールチケットがあります" in html or "リセール申込" in html:
-        notify_all(
-            "🚨 RESALE TICKETS APPEARED — ACT NOW!",
-            "Resale section is live on pia.jp for Cricket T20 Asian Games.",
-            RESALE_URL,
-        )
         sys.exit(0)
 
-    # 2. Find the CKT22 session block
+    # Find the CKT22 block
     idx = html.find(TARGET_SESSION)
     if idx == -1:
-        print("⚠️  CKT22 block not found — page may have changed structure")
+        print("⚠️  CKT22 block not found — page structure may have changed")
         sys.exit(0)
 
-    # Extract ~1500 chars after the CKT22 marker (covers price + status button)
-    block = html[idx: idx + 1500]
+    # Extract only the CKT22 section (not the whole page)
+    block = html[idx: idx + BLOCK_SIZE]
 
-    # 3. Check if a buy button appeared
-    if "枚数選択へ" in block or "発売中" in block:
-        notify_all(
-            "🚨 CKT22 TICKETS AVAILABLE — BUY NOW!",
-            "Oct 3 14:00 Gold Medal Cricket Final — buy button is LIVE on pia.jp!",
-            TARGET_URL,
-        )
-        sys.exit(0)
+    print(f"📄 CKT22 block snippet (first 300 chars):\n{block[:300]}\n")
 
-    # 4. Still sold out — log and exit cleanly
-    if "予定枚数終了" in block:
+    # Check for sold out first
+    if SOLD_OUT_MARKER in block:
         print("✅ Status: Still sold out (予定枚数終了). No action needed.")
-    else:
-        print("⚠️  Unknown status — no known markers found in CKT22 block.")
+        sys.exit(0)
 
+    # Check for any availability trigger
+    for trigger in AVAILABLE_TRIGGERS:
+        if trigger in block:
+            print(f"🔔 Trigger found: '{trigger}'")
+            notify_all(
+                "CKT22 TICKETS AVAILABLE — BUY NOW!",
+                f"Oct 3 14:00 Gold Medal Cricket Final\nTrigger detected: {trigger}\n\nOpen pia.jp immediately and buy!",
+            )
+            sys.exit(0)
+
+    # Neither sold out nor available — unknown state
+    print("⚠️  Unknown status — neither sold-out nor buy-button found in CKT22 block.")
+    print(f"Full block for debugging:\n{block}")
     sys.exit(0)
 
 

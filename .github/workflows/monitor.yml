@@ -1,0 +1,32 @@
+name: PIA Cricket Ticket Monitor
+
+on:
+  schedule:
+    # Runs every 5 minutes  (minimum GitHub allows is 5 min)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # Allows manual trigger from GitHub UI for testing
+
+jobs:
+  check-tickets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run ticket checker
+        env:
+          GMAIL_USER:    ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS:    ${{ secrets.GMAIL_PASS }}
+          NOTIFY_EMAIL:  ${{ secrets.NOTIFY_EMAIL }}
+          LINE_TOKEN:    ${{ secrets.LINE_TOKEN }}
+        run: python check_ticket.py
